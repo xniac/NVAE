@@ -481,3 +481,24 @@ def groups_per_scale(num_scales, num_groups_per_scale, is_adaptive, divider=2, m
             n = n // divider
             n = max(minimum_groups, n)
     return g
+
+def optimizer_to(optim, device):
+    print("moving to ", device)
+    for group in optim.param_groups:
+        for i, p in enumerate(group['params']):
+            if p.grad is None:
+                continue
+            p.grad.data = p.grad.data.to(device)
+
+    for param in optim.state.values():
+        # Not sure there are any global tensors in the state dict
+        if isinstance(param, torch.Tensor):
+            param.data = param.data.to(device)
+            if param._grad is not None:
+                param._grad.data = param._grad.data.to(device)
+        elif isinstance(param, dict):
+            for subparam in param.values():
+                if isinstance(subparam, torch.Tensor):
+                    subparam.data = subparam.data.to(device)
+                    if subparam._grad is not None:
+                        subparam._grad.data = subparam._grad.data.to(device)

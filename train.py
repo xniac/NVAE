@@ -15,7 +15,8 @@ import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.cuda.amp import autocast, GradScaler
 
-from model import AutoEncoder
+from model import AutoEncoder, DiffusionLayer
+from conditionalAE import ConditionalAutoEncoder
 from thirdparty.adamax import Adamax
 import utils
 import datasets
@@ -42,7 +43,8 @@ def main(args):
 
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
-    model = AutoEncoder(args, writer, arch_instance)
+    # model = AutoEncoder(args, writer, arch_instance)
+    model = ConditionalAutoEncoder(args, writer, arch_instance)
     model = model.cuda()
 
     logging.info('args = %s', args)
@@ -59,6 +61,7 @@ def main(args):
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
+    # utils.optimizer_to(cnn_optimizer, "cuda:0")
     grad_scalar = GradScaler(2**10)
 
     num_output = utils.num_output(args.dataset)
@@ -81,9 +84,9 @@ def main(args):
 
     for epoch in range(init_epoch, args.epochs):
         # update lrs.
-        if args.distributed:
-            train_queue.sampler.set_epoch(global_step + args.seed)
-            valid_queue.sampler.set_epoch(0)
+        # if args.distributed:
+        #     train_queue.sampler.set_epoch(global_step + args.seed)
+            # valid_queue.sampler.set_epoch(0)
 
         if epoch > args.warmup_epochs:
             cnn_scheduler.step()
@@ -147,10 +150,18 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
     model.train()
     for step, x in enumerate(train_queue):
         x = x[0] if len(x) > 1 else x
+        '''
+        Implement diffusion model here
+        '''
+        d1 = DiffusionLayer(0, 0.01)
+        x_1 = d1.diffuse(x)
+
         x = x.cuda()
+        x_1 = x_1.cuda()
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
+        x_1 = utils.pre_process(x_1, args.num_x_bits)
 
         # warm-up lr
         if global_step < warmup_iters:
@@ -159,12 +170,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 param_group['lr'] = lr
 
         # sync parameters, it may not be necessary
-        if step % 100 == 0:
-            utils.average_params(model.parameters(), args.distributed)
+        # if step % 100 == 0:
+        #     utils.average_params(model.parameters(), args.distributed)
 
         cnn_optimizer.zero_grad()
+
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(x)
+            logits, log_q, log_p, kl_all, kl_diag = model(x, x_1)
 
             output = model.decoder_output(logits)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
@@ -185,10 +197,20 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             else:
                 wdn_coeff = args.weight_decay_norm
 
-            loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
+            # loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
+            loss += bn_loss * wdn_coeff
 
         grad_scalar.scale(loss).backward()
-        utils.average_gradients(model.parameters(), args.distributed)
+        # utils.average_gradients(model.parameters(), args.distributed)
+        # utils.optimizer_to(cnn_optimizer, "cuda:0")
+        for group in cnn_optimizer.param_groups:
+            for i, p in enumerate(group['params']):
+                if p.grad is None:
+                    continue
+                if not p.grad.data.is_cuda:
+                    # print(p.grad.data.device)
+                    p.grad.data = p.grad.data.cuda()
+        cnn_optimizer.step()
         grad_scalar.step(cnn_optimizer)
         grad_scalar.update()
         nelbo.update(loss.data, 1)
@@ -315,14 +337,14 @@ def test_vae_fid(model, args, total_fid_samples):
     return fid
 
 
-def init_processes(rank, size, fn, args):
-    """ Initialize the distributed environment. """
-    os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
-    fn(args)
-    cleanup()
+# def init_processes(rank, size, fn, args):
+#     """ Initialize the distributed environment. """
+#     os.environ['MASTER_ADDR'] = args.master_address
+#     os.environ['MASTER_PORT'] = '6020'
+#     torch.cuda.set_device(args.local_rank)
+#     dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
+#     fn(args)
+#     cleanup()
 
 
 def cleanup():
@@ -439,25 +461,27 @@ if __name__ == '__main__':
 
     size = args.num_process_per_node
 
-    if size > 1:
-        args.distributed = True
-        processes = []
-        for rank in range(size):
-            args.local_rank = rank
-            global_rank = rank + args.node_rank * args.num_process_per_node
-            global_size = args.num_proc_node * args.num_process_per_node
-            args.global_rank = global_rank
-            print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
-            p = Process(target=init_processes, args=(global_rank, global_size, main, args))
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-    else:
-        # for debugging
-        print('starting in debug mode')
-        args.distributed = True
-        init_processes(0, size, main, args)
+    # if size > 1:
+    #     args.distributed = True
+    #     processes = []
+    #     for rank in range(size):
+    #         args.local_rank = rank
+    #         global_rank = rank + args.node_rank * args.num_process_per_node
+    #         global_size = args.num_proc_node * args.num_process_per_node
+    #         args.global_rank = global_rank
+    #         print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
+    #         p = Process(target=init_processes, args=(global_rank, global_size, main, args))
+    #         p.start()
+    #         processes.append(p)
+    #
+    #     for p in processes:
+    #         p.join()
+    # else:
+    #     # for debugging
+    #     print('starting in debug mode')
+    #     args.distributed = True
+    #     init_processes(0, size, main, args)
+    args.distributed = True
+    main(args)
 
 

@@ -111,7 +111,7 @@ class SyncBatchNormSwish(_BatchNorm):
     def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True,
                  track_running_stats=True, process_group=None):
         super(SyncBatchNormSwish, self).__init__(num_features, eps, momentum, affine, track_running_stats)
-        self.process_group = process_group
+        # self.process_group = process_group
         # gpu_size is set through DistributedDataParallel initialization. This is to ensure that SyncBatchNorm is used
         # under supported condition (single GPU per process)
         self.ddp_gpu_size = None
@@ -148,26 +148,26 @@ class SyncBatchNormSwish(_BatchNorm):
             else:  # use exponential moving average
                 exponential_average_factor = self.momentum
 
-        need_sync = self.training or not self.track_running_stats
-        if need_sync:
-            process_group = torch.distributed.group.WORLD
-            if self.process_group:
-                process_group = self.process_group
-            world_size = torch.distributed.get_world_size(process_group)
-            need_sync = world_size > 1
+        # need_sync = self.training or not self.track_running_stats
+        # if need_sync:
+        #     process_group = torch.distributed.group.WORLD
+        #     if self.process_group:
+        #         process_group = self.process_group
+        #     world_size = torch.distributed.get_world_size(process_group)
+        #     need_sync = world_size > 1
 
         # fallback to framework BN when synchronization is not necessary
-        if not need_sync:
-            out = F.batch_norm(
-                input, self.running_mean, self.running_var, self.weight, self.bias,
-                self.training or not self.track_running_stats,
-                exponential_average_factor, self.eps)
-            return swish.apply(out)
-        else:
-            # av: I only use it in this setting.
-            if not self.ddp_gpu_size and False:
-                raise AttributeError('SyncBatchNorm is only supported within torch.nn.parallel.DistributedDataParallel')
-
-            return sync_batch_norm.apply(
-                input, self.weight, self.bias, self.running_mean, self.running_var,
-                self.eps, exponential_average_factor, process_group, world_size)
+        # if not need_sync:
+        out = F.batch_norm(
+            input, self.running_mean, self.running_var, self.weight, self.bias,
+            self.training or not self.track_running_stats,
+            exponential_average_factor, self.eps)
+        return swish.apply(out)
+        # else:
+        #     # av: I only use it in this setting.
+        #     if not self.ddp_gpu_size and False:
+        #         raise AttributeError('SyncBatchNorm is only supported within torch.nn.parallel.DistributedDataParallel')
+        #
+        #     return sync_batch_norm.apply(
+        #         input, self.weight, self.bias, self.running_mean, self.running_var,
+        #         self.eps, exponential_average_factor, process_group, world_size)
