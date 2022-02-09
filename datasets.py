@@ -210,9 +210,12 @@ def get_loaders_eval(dataset, args):
         raise NotImplementedError
 
     train_sampler, valid_sampler = None, None
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
-        valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_data)
+
+    train_sampler = torch.utils.data.RandomSampler(train_data)
+    valid_sampler = torch.utils.data.RandomSampler(valid_data)
+    # if args.distributed:
+    #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+    #     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_data)
 
     train_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
