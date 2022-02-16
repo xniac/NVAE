@@ -12,6 +12,7 @@ class ConditionalAutoEncoder(nn.Module):
         self.use_se = args.use_se
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
+        self.u_shape = args.u_shape
 
         self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
         self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
@@ -179,12 +180,20 @@ class ConditionalAutoEncoder(nn.Module):
                 cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=3, padding=1, bias=True)
                 enc_sampler.append(cell)
                 # build NF
-                for n in range(self.num_flows):
-                    arch = self.arch_instance['ar_nn']
-                    num_c1 = int(self.num_channels_enc * mult)
-                    num_c2 = 8 * self.num_latent_per_group  # use 8x features
-                    nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
+                # for n in range(self.num_flows):
+                #     arch = self.arch_instance['ar_nn']
+                #     num_c1 = int(self.num_channels_enc * mult)
+                #     num_c2 = 8 * self.num_latent_per_group  # use 8x features
+                #     nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
                 if not (s == 0 and g == 0):  # for the first group, we use a fixed standard Normal.
+                    num_c = int(self.num_channels_dec * mult)
+                    if self.u_shape:
+                        num_c *= 2
+                    cell = nn.Sequential(
+                        nn.ELU(),
+                        Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True))
+                    dec_sampler.append(cell)
+                else:
                     num_c = int(self.num_channels_dec * mult)
                     cell = nn.Sequential(
                         nn.ELU(),
@@ -266,61 +275,72 @@ class ConditionalAutoEncoder(nn.Module):
         # run the main encoder tower
         combiner_cells_enc = []
         combiner_cells_s = []
-        combiner_cells_cond_s = []
         for cell in self.enc_tower:
+            # combiner_cell_s record left part of q(z_i|x), z_l, z_l-1, ..., z_1
             if cell.cell_type == 'combiner_enc':
                 combiner_cells_enc.append(cell)
                 combiner_cells_s.append(s)
             else:
                 s = cell(s)
-
-        for cell in self.cond_enc_tower:
-            if cell.cell_type == 'combiner_enc':
-                combiner_cells_cond_s.append(cond_s)
-            else:
-                cond_s = cell(cond_s)
-
-        # reverse combiner cells and their input for decoder
         combiner_cells_enc.reverse()
         combiner_cells_s.reverse()
-        combiner_cells_cond_s.reverse()
+
+        if self.u_shape:
+            combiner_cells_cond_enc = []
+            combiner_cells_cond_s = []
+            for cell in self.cond_enc_tower:
+                if cell.cell_type == 'combiner_enc':
+                    combiner_cells_cond_enc.append(cell)
+                    combiner_cells_cond_s.append(cond_s)
+                else:
+                    cond_s = cell(cond_s)
+            combiner_cells_cond_enc.reverse()
+            combiner_cells_cond_s.reverse()
+
+        # reverse combiner cells and their input for decoder: left part of q(z_i|x), z_1, ..., z_l-1, z_l
+
+
         idx_dec = 0
+
+        # prior for z0
+        # TODO: still use the original encoder and sample
+
+        cond_ftr = self.enc0(cond_s)
+        cond_param = self.dec_sampler[idx_dec](cond_ftr)
+        mu_p, log_sig_p = torch.chunk(cond_param, 2, dim=1)
+
         ftr = self.enc0(s)                            # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
-        dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
+        dist = Normal(mu_q+mu_p, log_sig_q+log_sig_p)   # for the first approx. posterior
         z, _ = dist.sample()
         log_q_conv = dist.log_p(z)
 
         # apply normalizing flows
-        nf_offset = 0
-        for n in range(self.num_flows):
-            z, log_det = self.nf_cells[n](z, ftr)
-            log_q_conv -= log_det
-        nf_offset += self.num_flows
+
+        # all_q records q(z_l|x, z_<l)
         all_q = [dist]
         all_log_q = [log_q_conv]
-
-        # To make sure we do not pass any deterministic features from x to decoder.
-        s = 0
-
-        # prior for z0
-        # dist: p(z|x, x_1)
-        dist = Normal(mu=torch.zeros_like(z), log_sigma=torch.zeros_like(z))
+        dist = Normal(mu_p, log_sig_p)
         log_p_conv = dist.log_p(z)
+        # all_p records p(z_l|z<l)
         all_p = [dist]
         all_log_p = [log_p_conv]
 
-        idx_dec = 0
-        # s = self.prior_ftr0.unsqueeze(0)
-        # batch_size = z.size(0)
-        # s = s.expand(batch_size, -1, -1, -1)
+        # To make sure we do not pass any deterministic features from x to decoder.
+        s = 0
         s = cond_s
         for cell in self.dec_tower:
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
-                    param = self.dec_sampler[idx_dec - 1](s)
+                    if self.u_shape:
+                        cond_ftr = combiner_cells_cond_enc[idx_dec - 1](combiner_cells_cond_s[idx_dec - 1], s)
+                        stack_s = torch.cat([cond_ftr, s], dim=1)
+                        param = self.dec_sampler[idx_dec](stack_s)
+                    else:
+                        param = self.dec_sampler[idx_dec](s)
+
                     mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
                     # form encoder
@@ -331,10 +351,7 @@ class ConditionalAutoEncoder(nn.Module):
                     z, _ = dist.sample()
                     log_q_conv = dist.log_p(z)
                     # apply NF
-                    for n in range(self.num_flows):
-                        z, log_det = self.nf_cells[nf_offset + n](z, ftr)
-                        log_q_conv -= log_det
-                    nf_offset += self.num_flows
+
                     all_log_q.append(log_q_conv)
                     all_q.append(dist)
 
@@ -363,10 +380,8 @@ class ConditionalAutoEncoder(nn.Module):
         kl_diag = []
         log_p, log_q = 0., 0.
         for q, p, log_q_conv, log_p_conv in zip(all_q, all_p, all_log_q, all_log_p):
-            if self.with_nf:
-                kl_per_var = log_q_conv - log_p_conv
-            else:
-                kl_per_var = q.kl(p)
+
+            kl_per_var = q.kl(p)
 
             kl_diag.append(torch.mean(torch.sum(kl_per_var, dim=[2, 3]), dim=0))
             kl_all.append(torch.sum(kl_per_var, dim=[1, 2, 3]))
@@ -389,7 +404,11 @@ class ConditionalAutoEncoder(nn.Module):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
-                    param = self.dec_sampler[idx_dec - 1](s)
+                    if self.u_shape:
+                        stack_s = torch.cat([s,s], dim=1)
+                        param = self.dec_sampler[idx_dec](stack_s)
+                    else:
+                        param = self.dec_sampler[idx_dec](s)
                     mu, log_sigma = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu, log_sigma, t)
                     z, _ = dist.sample()
@@ -422,48 +441,3 @@ class ConditionalAutoEncoder(nn.Module):
                 return DiscMixLogistic(logits, self.num_mix_output, num_bits=self.num_bits)
         else:
             raise NotImplementedError
-
-    def spectral_norm_parallel(self):
-        """ This method computes spectral normalization for all conv layers in parallel. This method should be called
-         after calling the forward method of all the conv layers in each iteration. """
-
-        weights = {}   # a dictionary indexed by the shape of weights
-        for l in self.all_conv_layers:
-            weight = l.weight_normalized
-            weight_mat = weight.view(weight.size(0), -1).cuda()
-            if weight_mat.shape not in weights:
-                weights[weight_mat.shape] = []
-
-            weights[weight_mat.shape].append(weight_mat)
-        loss = 0
-        for i in weights:
-            weights[i] = torch.stack(weights[i], dim=0)
-            with torch.no_grad():
-                num_iter = self.num_power_iter
-                if i not in self.sr_u:
-                    num_w, row, col = weights[i].shape
-                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).cuda(), dim=1, eps=1e-3)
-                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).cuda(), dim=1, eps=1e-3)
-                    # increase the number of iterations for the first time
-                    num_iter = 10 * self.num_power_iter
-
-                for j in range(num_iter):
-                    # Spectral norm of weight equals to `u^T W v`, where `u` and `v`
-                    # are the first left and right singular vectors.
-                    # This power iteration produces approximations of `u` and `v`.
-                    self.sr_v[i] = F.normalize(torch.matmul(self.sr_u[i].unsqueeze(1), weights[i]).squeeze(1),
-                                               dim=1, eps=1e-3)  # bx1xr * bxrxc --> bx1xc --> bxc
-                    self.sr_u[i] = F.normalize(torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)).squeeze(2),
-                                               dim=1, eps=1e-3)  # bxrxc * bxcx1 --> bxrx1  --> bxr
-
-            sigma = torch.matmul(self.sr_u[i].unsqueeze(1), torch.matmul(weights[i], self.sr_v[i].unsqueeze(2)))
-            loss += torch.sum(sigma)
-        return loss
-
-    def batchnorm_loss(self):
-        loss = 0
-        for l in self.all_bn_layers:
-            if l.affine:
-                loss += torch.max(torch.abs(l.weight))
-
-        return loss

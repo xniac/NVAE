@@ -44,6 +44,7 @@ def main(args):
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     # model = AutoEncoder(args, writer, arch_instance)
+    args.u_shape = True
     model = ConditionalAutoEncoder(args, writer, arch_instance)
     model = model.cuda()
 
@@ -176,6 +177,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         cnn_optimizer.zero_grad()
 
         with autocast():
+            # logits, log_q, log_p, kl_all, kl_diag = model(x)
             logits, log_q, log_p, kl_all, kl_diag = model(x, x_1)
 
             output = model.decoder_output(logits)
@@ -187,30 +189,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
             nelbo_batch = recon_loss + balanced_kl
             loss = torch.mean(nelbo_batch)
-            norm_loss = model.spectral_norm_parallel()
-            bn_loss = model.batchnorm_loss()
-            # get spectral regularization coefficient (lambda)
-            if args.weight_decay_norm_anneal:
-                assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
-                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
-                wdn_coeff = np.exp(wdn_coeff)
-            else:
-                wdn_coeff = args.weight_decay_norm
-
-            # loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
-            loss += bn_loss * wdn_coeff
 
         grad_scalar.scale(loss).backward()
-        # utils.average_gradients(model.parameters(), args.distributed)
-        # utils.optimizer_to(cnn_optimizer, "cuda:0")
-        for group in cnn_optimizer.param_groups:
-            for i, p in enumerate(group['params']):
-                if p.grad is None:
-                    continue
-                if not p.grad.data.is_cuda:
-                    # print(p.grad.data.device)
-                    p.grad.data = p.grad.data.cuda()
-        cnn_optimizer.step()
         grad_scalar.step(cnn_optimizer)
         grad_scalar.update()
         nelbo.update(loss.data, 1)
@@ -227,11 +207,11 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 writer.add_image('reconstruction', in_out_tiled, global_step)
 
             # norm
-            writer.add_scalar('train/norm_loss', norm_loss, global_step)
-            writer.add_scalar('train/bn_loss', bn_loss, global_step)
-            writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
+            # writer.add_scalar('train/norm_loss', norm_loss, global_step)
+            # writer.add_scalar('train/bn_loss', bn_loss, global_step)
+            # writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
 
-            utils.average_tensor(nelbo.avg, args.distributed)
+            # utils.average_tensor(nelbo.avg, args.distributed)
             logging.info('train %d %f', global_step, nelbo.avg)
             writer.add_scalar('train/nelbo_avg', nelbo.avg, global_step)
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
@@ -242,7 +222,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
-                utils.average_tensor(kl_diag_i, args.distributed)
+                # utils.average_tensor(kl_diag_i, args.distributed)
                 num_active = torch.sum(kl_diag_i > 0.1).detach()
                 total_active += num_active
 
@@ -254,27 +234,35 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
 
         global_step += 1
 
-    utils.average_tensor(nelbo.avg, args.distributed)
+    # utils.average_tensor(nelbo.avg, args.distributed)
     return nelbo.avg, global_step
 
 
 def test(valid_queue, model, num_samples, args, logging):
-    if args.distributed:
-        dist.barrier()
+    # if args.distributed:
+    #     dist.barrier()
     nelbo_avg = utils.AvgrageMeter()
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
     for step, x in enumerate(valid_queue):
         x = x[0] if len(x) > 1 else x
+        '''
+        Implement diffusion model here
+        '''
+        d1 = DiffusionLayer(0, 0.01)
+        x_1 = d1.diffuse(x)
+
         x = x.cuda()
+        x_1 = x_1.cuda()
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
+        x_1 = utils.pre_process(x_1, args.num_x_bits)
 
         with torch.no_grad():
             nelbo, log_iw = [], []
             for k in range(num_samples):
-                logits, log_q, log_p, kl_all, _ = model(x)
+                logits, log_q, log_p, kl_all, _ = model(x, x_1)
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
                 balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
@@ -288,11 +276,11 @@ def test(valid_queue, model, num_samples, args, logging):
         nelbo_avg.update(nelbo.data, x.size(0))
         neg_log_p_avg.update(- log_p.data, x.size(0))
 
-    utils.average_tensor(nelbo_avg.avg, args.distributed)
-    utils.average_tensor(neg_log_p_avg.avg, args.distributed)
-    if args.distributed:
-        # block to sync
-        dist.barrier()
+    # utils.average_tensor(nelbo_avg.avg, args.distributed)
+    # utils.average_tensor(neg_log_p_avg.avg, args.distributed)
+    # if args.distributed:
+    #     # block to sync
+    #     dist.barrier()
     logging.info('val, step: %d, NELBO: %f, neg Log p %f', step, nelbo_avg.avg, neg_log_p_avg.avg)
     return neg_log_p_avg.avg, nelbo_avg.avg
 
@@ -481,7 +469,7 @@ if __name__ == '__main__':
     #     print('starting in debug mode')
     #     args.distributed = True
     #     init_processes(0, size, main, args)
-    args.distributed = True
+    args.distributed = False
     main(args)
 
 
