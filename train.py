@@ -14,6 +14,8 @@ import os
 import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.cuda.amp import autocast, GradScaler
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
 
 from model import AutoEncoder, DiffusionLayer
 from conditionalAE import ConditionalAutoEncoder
@@ -40,7 +42,13 @@ def main(args):
     args.num_total_iter = len(train_queue) * args.epochs
     warmup_iters = len(train_queue) * args.warmup_epochs
     swa_start = len(train_queue) * (args.epochs - 1)
+    valid_transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
+    valid_data = dset.CIFAR10(
+        root=args.data, train=False, download=True, transform=valid_transform)
 
+    d1 = DiffusionLayer(0, 0.1)
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     # model = AutoEncoder(args, writer, arch_instance)
@@ -96,25 +104,37 @@ def main(args):
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
+        train_nelbo, global_step = train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
         logging.info('train_nelbo %f', train_nelbo)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
 
         model.eval()
         # generate samples less frequently
-        eval_freq = 1 if args.epochs <= 50 else 20
+        # eval_freq = 1 if args.epochs <= 50 else 20
+        eval_freq = 5
         if epoch % eval_freq == 0 or epoch == (args.epochs - 1):
             with torch.no_grad():
                 num_samples = 16
                 n = int(np.floor(np.sqrt(num_samples)))
-                for t in [0.7, 0.8, 0.9, 1.0]:
-                    logits = model.sample(num_samples, t)
-                    output = model.decoder_output(logits)
-                    output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
-                    output_tiled = utils.tile_image(output_img, n)
-                    writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
+                valid_image = []
+                for i in range(num_samples):
+                    valid_image.append(valid_data[i][0].unsqueeze(0))
+                valid_x = torch.cat(valid_image)
+                valid_x1 = d1.diffuse(valid_x)
+                valid_x = valid_x.cuda()
+                valid_x1 = valid_x1.cuda()
 
-            valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=10, args=args, logging=logging)
+                logits = model.sample(valid_x1)
+                output = model.decoder_output(logits)
+                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
+                output_tiled = utils.tile_image(output_img, n)
+                original_tiled = utils.tile_image(valid_x, n)
+                noisy_tiled = utils.tile_image(valid_x1, n)
+                writer.add_image('generated', output_tiled, global_step)
+                writer.add_image('noisy', noisy_tiled, global_step)
+                writer.add_image('original', original_tiled)
+
+            valid_neg_log_p, valid_nelbo = test(valid_queue, model, d1, num_samples=10, args=args, logging=logging)
             logging.info('valid_nelbo %f', valid_nelbo)
             logging.info('valid neg log p %f', valid_neg_log_p)
             logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
@@ -134,7 +154,7 @@ def main(args):
                             'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
 
     # Final validation
-    valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
+    valid_neg_log_p, valid_nelbo = test(valid_queue, model, d1, num_samples=1000, args=args, logging=logging)
     logging.info('final valid nelbo %f', valid_nelbo)
     logging.info('final valid neg log p %f', valid_neg_log_p)
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
@@ -144,7 +164,7 @@ def main(args):
     writer.close()
 
 
-def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
@@ -154,7 +174,6 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         '''
         Implement diffusion model here
         '''
-        d1 = DiffusionLayer(0, 0.01)
         x_1 = d1.diffuse(x)
 
         x = x.cuda()
@@ -238,7 +257,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
     return nelbo.avg, global_step
 
 
-def test(valid_queue, model, num_samples, args, logging):
+def test(valid_queue, model, d1, num_samples, args, logging):
     # if args.distributed:
     #     dist.barrier()
     nelbo_avg = utils.AvgrageMeter()
@@ -249,7 +268,6 @@ def test(valid_queue, model, num_samples, args, logging):
         '''
         Implement diffusion model here
         '''
-        d1 = DiffusionLayer(0, 0.01)
         x_1 = d1.diffuse(x)
 
         x = x.cuda()

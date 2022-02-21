@@ -265,7 +265,7 @@ class ConditionalAutoEncoder(nn.Module):
         # concat the x with condition_x at the channel dim, passing through the input together
         x_stack = torch.cat([x, cond_x], dim=1)
         s = self.stem(2 * x_stack - 1.0)
-        cond_s = self.cond_stem( 2 * cond_x - 1)
+        cond_s = self.cond_stem(2 * cond_x - 1)
 
         # perform pre-processing
         for cell in self.pre_process:
@@ -322,6 +322,7 @@ class ConditionalAutoEncoder(nn.Module):
         all_q = [dist]
         all_log_q = [log_q_conv]
         dist = Normal(mu_p, log_sig_p)
+        # z, _ = dist.sample() #TODO: whether z need to be resampled?
         log_p_conv = dist.log_p(z)
         # all_p records p(z_l|z<l)
         all_p = [dist]
@@ -390,27 +391,54 @@ class ConditionalAutoEncoder(nn.Module):
 
         return logits, log_q, log_p, kl_all, kl_diag
 
-    def sample(self, num_samples, t):
+    def sample(self, cond_x):
+
+        cond_s = self.cond_stem(2 * cond_x - 1)
+        for cell in self.pre_process:
+            cond_s = cell(cond_s)
+
+        if self.u_shape:
+            combiner_cells_cond_enc = []
+            combiner_cells_cond_s = []
+            for cell in self.cond_enc_tower:
+                if cell.cell_type == 'combiner_enc':
+                    combiner_cells_cond_enc.append(cell)
+                    combiner_cells_cond_s.append(cond_s)
+                else:
+                    cond_s = cell(cond_s)
+            combiner_cells_cond_enc.reverse()
+            combiner_cells_cond_s.reverse()
+
         scale_ind = 0
-        z0_size = [num_samples] + self.z0_size
-        dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=t)
+        idx_dec = 0
+
+        # prior for z0
+        # TODO: still use the original encoder and sample
+
+        cond_ftr = self.enc0(cond_s)
+        cond_param = self.dec_sampler[idx_dec](cond_ftr)
+        mu_p, log_sig_p = torch.chunk(cond_param, 2, dim=1)
+        dist = Normal(mu_p, log_sig_p)
         z, _ = dist.sample()
 
-        idx_dec = 0
-        s = self.prior_ftr0.unsqueeze(0)
-        batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1)
+        # To make sure we do not pass any deterministic features from x to decoder.
+        s = cond_s
+
         for cell in self.dec_tower:
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
                     if self.u_shape:
-                        stack_s = torch.cat([s,s], dim=1)
+                        cond_ftr = combiner_cells_cond_enc[idx_dec - 1](combiner_cells_cond_s[idx_dec - 1], s)
+                        stack_s = torch.cat([cond_ftr, s], dim=1)
                         param = self.dec_sampler[idx_dec](stack_s)
                     else:
                         param = self.dec_sampler[idx_dec](s)
-                    mu, log_sigma = torch.chunk(param, 2, dim=1)
-                    dist = Normal(mu, log_sigma, t)
+
+                    mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
+
+                    # evaluate log_p(z)
+                    dist = Normal(mu_p, log_sig_p)
                     z, _ = dist.sample()
 
                 # 'combiner_dec'
@@ -418,8 +446,6 @@ class ConditionalAutoEncoder(nn.Module):
                 idx_dec += 1
             else:
                 s = cell(s)
-                if cell.cell_type == 'up_dec':
-                    scale_ind += 1
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)
