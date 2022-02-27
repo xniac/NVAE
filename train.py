@@ -48,7 +48,7 @@ def main(args):
     valid_data = dset.CIFAR10(
         root=args.data, train=False, download=True, transform=valid_transform)
 
-    d1 = DiffusionLayer(0, 0.1)
+    d1 = DiffusionLayer(0, 1)
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     # model = AutoEncoder(args, writer, arch_instance)
@@ -121,10 +121,12 @@ def main(args):
                     valid_image.append(valid_data[i][0].unsqueeze(0))
                 valid_x = torch.cat(valid_image)
                 valid_x1 = d1.diffuse(valid_x)
+                valid_x1 = torch.clamp(valid_x1, 0, 1)
                 valid_x = valid_x.cuda()
                 valid_x1 = valid_x1.cuda()
 
                 logits = model.sample(valid_x1)
+                # logits = model.sample(num_samples, 1)
                 output = model.decoder_output(logits)
                 output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
                 output_tiled = utils.tile_image(output_img, n)
@@ -175,7 +177,7 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
         Implement diffusion model here
         '''
         x_1 = d1.diffuse(x)
-
+        x_1 = torch.clamp(x_1, 0, 1)
         x = x.cuda()
         x_1 = x_1.cuda()
 
@@ -269,6 +271,7 @@ def test(valid_queue, model, d1, num_samples, args, logging):
         Implement diffusion model here
         '''
         x_1 = d1.diffuse(x)
+        x_1 = torch.clamp(x_1, 0, 1)
 
         x = x.cuda()
         x_1 = x_1.cuda()
@@ -280,6 +283,7 @@ def test(valid_queue, model, d1, num_samples, args, logging):
         with torch.no_grad():
             nelbo, log_iw = [], []
             for k in range(num_samples):
+                # logits, log_q, log_p, kl_all, _ = model(x)
                 logits, log_q, log_p, kl_all, _ = model(x, x_1)
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)

@@ -322,7 +322,6 @@ class ConditionalAutoEncoder(nn.Module):
         all_q = [dist]
         all_log_q = [log_q_conv]
         dist = Normal(mu_p, log_sig_p)
-        # z, _ = dist.sample() #TODO: whether z need to be resampled?
         log_p_conv = dist.log_p(z)
         # all_p records p(z_l|z<l)
         all_p = [dist]
