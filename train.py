@@ -17,7 +17,7 @@ from torch.cuda.amp import autocast, GradScaler
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 
-from model import AutoEncoder, DiffusionLayer
+from model import AutoEncoder
 from conditionalAE import ConditionalAutoEncoder
 from thirdparty.adamax import Adamax
 import utils
@@ -26,7 +26,9 @@ import datasets
 from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 from fid.inception import InceptionV3
 
-
+BETA_MIN = 0.1
+BETA_MAX = 200
+T_STEP = 4
 def main(args):
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
@@ -42,18 +44,25 @@ def main(args):
     args.num_total_iter = len(train_queue) * args.epochs
     warmup_iters = len(train_queue) * args.warmup_epochs
     swa_start = len(train_queue) * (args.epochs - 1)
-    valid_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-    valid_data = dset.CIFAR10(
-        root=args.data, train=False, download=True, transform=valid_transform)
+    layer_num = args.diffusion_layer
+    if args.dataset == 'cifar10':
+        # training on CIFAR dataset
+        _, valid_transform = datasets._data_transforms_cifar10(args)
+        valid_data = dset.CIFAR10(
+            root=args.data, train=False, download=True, transform=valid_transform)
+    elif args.dataset == 'mnist':
+        _, valid_transform = datasets._data_transforms_mnist(args)
+        valid_data = dset.MNIST(
+            root=args.data, train=False, download=True, transform=valid_transform)
 
-    d1 = DiffusionLayer(0, 1)
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     # model = AutoEncoder(args, writer, arch_instance)
     args.u_shape = True
-    model = ConditionalAutoEncoder(args, writer, arch_instance)
+    if layer_num > T_STEP:
+        model = AutoEncoder(args, writer, arch_instance)
+    else:
+        model = ConditionalAutoEncoder(args, writer, arch_instance)
     model = model.cuda()
 
     logging.info('args = %s', args)
@@ -104,7 +113,7 @@ def main(args):
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, global_step = train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
+        train_nelbo, global_step = train(train_queue, model, layer_num, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
         logging.info('train_nelbo %f', train_nelbo)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
 
@@ -120,23 +129,35 @@ def main(args):
                 for i in range(num_samples):
                     valid_image.append(valid_data[i][0].unsqueeze(0))
                 valid_x = torch.cat(valid_image)
-                valid_x1 = d1.diffuse(valid_x)
-                valid_x1 = torch.clamp(valid_x1, 0, 1)
-                valid_x = valid_x.cuda()
-                valid_x1 = valid_x1.cuda()
+                x_cond = valid_x
+                x_org = None
+                for i in range(layer_num):
+                    t_p = float((i + 1) / T_STEP)
+                    beta_t = 1 - np.exp(- BETA_MIN * t_p - 0.5 * (BETA_MAX - BETA_MIN) * (t_p ** 2))
+                    x_org = x_cond
+                    x_cond = torch.normal(mean=(1 - beta_t) ** 0.5 * x_org, std=beta_t)
 
-                logits = model.sample(valid_x1)
-                # logits = model.sample(num_samples, 1)
+                x_cond = torch.clamp(x_cond, 0, 1)
+                x_org = torch.clamp(x_org, 0, 1)
+
+                x_org = x_org.cuda()
+                x_cond = x_cond.cuda()
+
+                if layer_num > T_STEP:
+                    logits = model.sample(num_samples, 1)
+                else:
+                    logits = model.sample(x_cond)
+
                 output = model.decoder_output(logits)
                 output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
                 output_tiled = utils.tile_image(output_img, n)
-                original_tiled = utils.tile_image(valid_x, n)
-                noisy_tiled = utils.tile_image(valid_x1, n)
+                original_tiled = utils.tile_image(x_org, n)
+                noisy_tiled = utils.tile_image(x_cond, n)
                 writer.add_image('generated', output_tiled, global_step)
                 writer.add_image('noisy', noisy_tiled, global_step)
                 writer.add_image('original', original_tiled)
 
-            valid_neg_log_p, valid_nelbo = test(valid_queue, model, d1, num_samples=10, args=args, logging=logging)
+            valid_neg_log_p, valid_nelbo = test(valid_queue, model, layer_num, num_samples=10, args=args, logging=logging)
             logging.info('valid_nelbo %f', valid_nelbo)
             logging.info('valid neg log p %f', valid_neg_log_p)
             logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
@@ -156,7 +177,7 @@ def main(args):
                             'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
 
     # Final validation
-    valid_neg_log_p, valid_nelbo = test(valid_queue, model, d1, num_samples=1000, args=args, logging=logging)
+    valid_neg_log_p, valid_nelbo = test(valid_queue, model, layer_num, num_samples=1000, args=args, logging=logging)
     logging.info('final valid nelbo %f', valid_nelbo)
     logging.info('final valid neg log p %f', valid_neg_log_p)
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
@@ -166,7 +187,7 @@ def main(args):
     writer.close()
 
 
-def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def train(train_queue, model, layer_num, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
@@ -176,14 +197,22 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
         '''
         Implement diffusion model here
         '''
-        x_1 = d1.diffuse(x)
-        x_1 = torch.clamp(x_1, 0, 1)
-        x = x.cuda()
-        x_1 = x_1.cuda()
+        x_cond = x
+        x_org = None
+        for i in range(layer_num):
+            t_p = float((i+1)/T_STEP)
+            beta_t = 1 - np.exp(- BETA_MIN*t_p - 0.5*(BETA_MAX-BETA_MIN)*(t_p**2))
+            x_org = x_cond
+            x_cond = torch.normal(mean = (1-beta_t)**0.5 * x_org, std= beta_t)
 
+        x_cond = x_cond.cuda()
+        x_org = x_org.cuda()
+
+        x_cond = torch.clamp(x_cond, 0, 1)
+        x_org = torch.clamp(x_org, 0, 1)
         # change bit length
-        x = utils.pre_process(x, args.num_x_bits)
-        x_1 = utils.pre_process(x_1, args.num_x_bits)
+        x_cond = utils.pre_process(x_cond, args.num_x_bits)
+        x_org = utils.pre_process(x_org, args.num_x_bits)
 
         # warm-up lr
         if global_step < warmup_iters:
@@ -198,14 +227,16 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
         cnn_optimizer.zero_grad()
 
         with autocast():
-            # logits, log_q, log_p, kl_all, kl_diag = model(x)
-            logits, log_q, log_p, kl_all, kl_diag = model(x, x_1)
+            if layer_num > T_STEP:
+                logits, log_q, log_p, kl_all, kl_diag = model(x_org)
+            else:
+                logits, log_q, log_p, kl_all, kl_diag = model(x_org, x_cond)
 
             output = model.decoder_output(logits)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
 
-            recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+            recon_loss = utils.reconstruction_loss(output, x_org, crop=model.crop_output)
             balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
 
             nelbo_batch = recon_loss + balanced_kl
@@ -218,8 +249,8 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
 
         if (global_step + 1) % 100 == 0:
             if (global_step + 1) % 1000 == 0:  # reduced frequency
-                n = int(np.floor(np.sqrt(x.size(0))))
-                x_img = x[:n*n]
+                n = int(np.floor(np.sqrt(x_org.size(0))))
+                x_img = x_org[:n*n]
                 output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
                 output_img = output_img[:n*n]
                 x_tiled = utils.tile_image(x_img, n)
@@ -239,7 +270,7 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', loss, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
-            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
+            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x_org, crop=model.crop_output)), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
@@ -259,7 +290,7 @@ def train(train_queue, model, d1, cnn_optimizer, grad_scalar, global_step, warmu
     return nelbo.avg, global_step
 
 
-def test(valid_queue, model, d1, num_samples, args, logging):
+def test(valid_queue, model, layer_num, num_samples, args, logging):
     # if args.distributed:
     #     dist.barrier()
     nelbo_avg = utils.AvgrageMeter()
@@ -270,33 +301,43 @@ def test(valid_queue, model, d1, num_samples, args, logging):
         '''
         Implement diffusion model here
         '''
-        x_1 = d1.diffuse(x)
-        x_1 = torch.clamp(x_1, 0, 1)
+        x_cond = x
+        x_org = None
+        for i in range(layer_num):
+            t_p = float((i + 1) / T_STEP)
+            beta_t = 1 - np.exp(- BETA_MIN * t_p - 0.5 * (BETA_MAX - BETA_MIN) * (t_p ** 2))
+            x_org = x_cond
+            x_cond = torch.normal(mean=(1 - beta_t) ** 0.5 * x_org, std=beta_t)
 
-        x = x.cuda()
-        x_1 = x_1.cuda()
+        x_cond = x_cond.cuda()
+        x_org = x_org.cuda()
+
+        x_cond = torch.clamp(x_cond, 0, 1)
+        x_org = torch.clamp(x_org, 0, 1)
 
         # change bit length
-        x = utils.pre_process(x, args.num_x_bits)
-        x_1 = utils.pre_process(x_1, args.num_x_bits)
+        x_cond = utils.pre_process(x_cond, args.num_x_bits)
+        x_org = utils.pre_process(x_org, args.num_x_bits)
 
         with torch.no_grad():
             nelbo, log_iw = [], []
             for k in range(num_samples):
-                # logits, log_q, log_p, kl_all, _ = model(x)
-                logits, log_q, log_p, kl_all, _ = model(x, x_1)
+                if layer_num > T_STEP:
+                    logits, log_q, log_p, kl_all, _ = model(x_org)
+                else:
+                    logits, log_q, log_p, kl_all, _ = model(x_org, x_cond)
                 output = model.decoder_output(logits)
-                recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                recon_loss = utils.reconstruction_loss(output, x_org, crop=model.crop_output)
                 balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
                 nelbo_batch = recon_loss + balanced_kl
                 nelbo.append(nelbo_batch)
-                log_iw.append(utils.log_iw(output, x, log_q, log_p, crop=model.crop_output))
+                log_iw.append(utils.log_iw(output, x_org, log_q, log_p, crop=model.crop_output))
 
             nelbo = torch.mean(torch.stack(nelbo, dim=1))
             log_p = torch.mean(torch.logsumexp(torch.stack(log_iw, dim=1), dim=1) - np.log(num_samples))
 
-        nelbo_avg.update(nelbo.data, x.size(0))
-        neg_log_p_avg.update(- log_p.data, x.size(0))
+        nelbo_avg.update(nelbo.data, x_org.size(0))
+        neg_log_p_avg.update(- log_p.data, x_org.size(0))
 
     # utils.average_tensor(nelbo_avg.avg, args.distributed)
     # utils.average_tensor(neg_log_p_avg.avg, args.distributed)
@@ -465,6 +506,8 @@ if __name__ == '__main__':
                         help='address for master')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
+    parser.add_argument('--diffusion_layer', type=int, default=1,
+                        help='current layer number of diffusion')
     args = parser.parse_args()
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)

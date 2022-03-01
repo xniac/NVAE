@@ -539,12 +539,3 @@ class AutoEncoder(nn.Module):
                 loss += torch.max(torch.abs(l.weight))
 
         return loss
-
-class DiffusionLayer():
-    def __init__(self, mean, std) -> None:
-        self.mean, self.std = mean, std
-
-    def diffuse(self, x):
-        noise = np.random.normal(loc=self.mean, scale=self.std ,size=x.size())
-        noise = torch.from_numpy(noise).type(torch.float32)
-        return x + noise
