@@ -57,7 +57,6 @@ def main(args):
 
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
-    # model = AutoEncoder(args, writer, arch_instance)
     args.u_shape = True
     if layer_num > T_STEP:
         model = AutoEncoder(args, writer, arch_instance)
@@ -87,6 +86,7 @@ def main(args):
 
     # if load
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
+    sample_file = os.path.join(args.model_save, 'checkpoint'+str(layer_num)+'.pt')
     if args.cont_training:
         logging.info('loading the model.')
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
@@ -175,6 +175,7 @@ def main(args):
                             'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
                             'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
                             'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
+                torch.save({'state_dict': model.state_dict()}, sample_file)
 
     # Final validation
     valid_neg_log_p, valid_nelbo = test(valid_queue, model, layer_num, num_samples=1000, args=args, logging=logging)
@@ -197,13 +198,20 @@ def train(train_queue, model, layer_num, cnn_optimizer, grad_scalar, global_step
         '''
         Implement diffusion model here
         '''
-        x_cond = x
-        x_org = None
-        for i in range(layer_num):
-            t_p = float((i+1)/T_STEP)
-            beta_t = 1 - np.exp(- BETA_MIN*t_p - 0.5*(BETA_MAX-BETA_MIN)*(t_p**2))
-            x_org = x_cond
-            x_cond = torch.normal(mean = (1-beta_t)**0.5 * x_org, std= beta_t)
+        x_org = x
+        if layer_num>1:
+            t_p = float((layer_num-1)/T_STEP)
+            sigma_t = 1 - np.exp(- BETA_MIN*t_p - 0.5*(BETA_MAX-BETA_MIN)*(t_p**2))
+            x_org = torch.normal(mean = (1-sigma_t)**0.5 * x, std = sigma_t)
+        beta_t = 1 - np.exp(- BETA_MIN/T_STEP - 0.5*(BETA_MAX-BETA_MIN)*(2*layer_num-1)/(T_STEP**2))
+        x_cond = torch.normal(mean = (1-beta_t)**0.5 * x_org, std= beta_t)
+        # x_cond = x
+        # x_org = None
+        # for i in range(layer_num):
+        #     t_p = float((i+1)/T_STEP)
+        #     beta_t = 1 - np.exp(- BETA_MIN*t_p - 0.5*(BETA_MAX-BETA_MIN)*(t_p**2))
+        #     x_org = x_cond
+        #     x_cond = torch.normal(mean = (1-beta_t)**0.5 * x_org, std= beta_t)
 
         x_cond = x_cond.cuda()
         x_org = x_org.cuda()
@@ -301,13 +309,13 @@ def test(valid_queue, model, layer_num, num_samples, args, logging):
         '''
         Implement diffusion model here
         '''
-        x_cond = x
-        x_org = None
-        for i in range(layer_num):
-            t_p = float((i + 1) / T_STEP)
-            beta_t = 1 - np.exp(- BETA_MIN * t_p - 0.5 * (BETA_MAX - BETA_MIN) * (t_p ** 2))
-            x_org = x_cond
-            x_cond = torch.normal(mean=(1 - beta_t) ** 0.5 * x_org, std=beta_t)
+        x_org = x
+        if layer_num > 1:
+            t_p = float((layer_num - 1) / T_STEP)
+            sigma_t = 1 - np.exp(- BETA_MIN * t_p - 0.5 * (BETA_MAX - BETA_MIN) * (t_p ** 2))
+            x_org = torch.normal(mean=(1 - sigma_t) ** 0.5 * x, std=sigma_t)
+        beta_t = 1 - np.exp(- BETA_MIN / T_STEP - 0.5 * (BETA_MAX - BETA_MIN) * (2 * layer_num - 1) / (T_STEP ** 2))
+        x_cond = torch.normal(mean=(1 - beta_t) ** 0.5 * x_org, std=beta_t)
 
         x_cond = x_cond.cuda()
         x_org = x_org.cuda()
@@ -509,31 +517,15 @@ if __name__ == '__main__':
     parser.add_argument('--diffusion_layer', type=int, default=1,
                         help='current layer number of diffusion')
     args = parser.parse_args()
-    args.save = args.root + '/eval-' + args.save
+    args.model_save = args.root + '/sample-' + args.save
+    args.save = args.root + '/eval-' + args.save + '/layer' + str(args.diffusion_layer)
+    print(args.model_save)
+    print(args.save)
     utils.create_exp_dir(args.save)
+    utils.create_exp_dir(args.model_save)
 
     size = args.num_process_per_node
 
-    # if size > 1:
-    #     args.distributed = True
-    #     processes = []
-    #     for rank in range(size):
-    #         args.local_rank = rank
-    #         global_rank = rank + args.node_rank * args.num_process_per_node
-    #         global_size = args.num_proc_node * args.num_process_per_node
-    #         args.global_rank = global_rank
-    #         print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
-    #         p = Process(target=init_processes, args=(global_rank, global_size, main, args))
-    #         p.start()
-    #         processes.append(p)
-    #
-    #     for p in processes:
-    #         p.join()
-    # else:
-    #     # for debugging
-    #     print('starting in debug mode')
-    #     args.distributed = True
-    #     init_processes(0, size, main, args)
     args.distributed = False
     main(args)
 
